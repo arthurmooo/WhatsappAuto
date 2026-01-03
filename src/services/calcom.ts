@@ -17,7 +17,7 @@ export class CalComService {
 
     /**
      * Check availability for the event type.
-     * Automatically scans up to 7 days if no slots are found in the requested range.
+     * Scans up to 7 days if no slots are found in the requested range.
      * Converts returned slots to 'Europe/Paris' for clear specific display.
      */
     async getAvailability(startTime: string, endTime: string) {
@@ -25,10 +25,11 @@ export class CalComService {
         let currentEnd = endTime;
         let attempts = 0;
         const maxAttempts = 7; // Scan up to 7 days forward
+        const startTime_perf = Date.now();
 
         while (attempts < maxAttempts) {
             try {
-                console.log(`Checking availability from ${currentStart} to ${currentEnd} (Attempt ${attempts + 1})`);
+                console.log(`[PERF] Checking availability from ${currentStart} to ${currentEnd} (Attempt ${attempts + 1})`);
                 const response = await axios.get(`${CAL_API_URL}/slots`, {
                     params: {
                         apiKey: this.apiKey,
@@ -44,36 +45,35 @@ export class CalComService {
                 if (daysWithSlots.length > 0) {
                     const formattedSlots: any = {};
                     for (const day of daysWithSlots) {
-                        // Format day key with full French date including weekday
-                        // e.g., "2026-01-06" becomes "Lundi 6 janvier 2026"
                         const dayDate = parseISO(day);
                         const formattedDayKey = formatZoned(dayDate, 'EEEE d MMMM yyyy', { locale: fr, timeZone: 'Europe/Paris' });
 
                         formattedSlots[formattedDayKey] = slots[day].map((slot: any) => {
-                            // slot.time is UTC from Cal.com, e.g. "2026-01-05T08:00:00.000Z" (09:00 Paris)
                             const slotDate = new Date(slot.time);
-
-                            // 1. Format to Paris Time for user display ONLY
                             const displayTime = formatZoned(slotDate, 'HH:mm', { timeZone: 'Europe/Paris' });
-
-                            // 2. Create an EXPLICIT Offset ISO string for the booking ID.
-                            // e.g. "2026-01-05T09:00:00+01:00"
-                            // This matches the "09:00" visual but carries the correct UTC instant (08:00Z).
-                            // This helps the AI avoid "correcting" 08:00Z to 09:00Z.
                             const bookingTime = formatZoned(slotDate, "yyyy-MM-dd'T'HH:mm:ssXXX", { timeZone: 'Europe/Paris' });
 
                             return {
-                                time: bookingTime, // "2026-01-05T09:00:00+01:00"
+                                time: bookingTime,
                                 displayTime: displayTime
                             };
                         });
                     }
-                    return { slots: formattedSlots, message: "Found slots (Times shown are in Europe/Paris timezone). Day names are in French." };
+                    const duration = Date.now() - startTime_perf;
+                    console.log(`[PERF] getAvailability completed in ${duration}ms (found slots on attempt ${attempts + 1})`);
+
+                    let message = "Found slots (Times shown are in Europe/Paris timezone). Day names are in French.";
+                    if (attempts > 0) {
+                        const originalStart = formatZoned(parseISO(startTime), 'd MMMM', { locale: fr, timeZone: 'Europe/Paris' });
+                        // calculate the new start date
+                        const newStart = formatZoned(parseISO(currentStart), 'd MMMM', { locale: fr, timeZone: 'Europe/Paris' });
+                        message = `⚠️ ACTION REQUIRED: No slots were found for the originally requested date (${originalStart}). I automatically searched forward and found these slots starting from ${newStart}. DU DOIS préciser à l'utilisateur que ce n'est pas la date demandée initialement.`;
+                    }
+
+                    return { slots: formattedSlots, message: message };
                 }
 
                 // If no slots, increment day
-                // We assume the user asked for a small range (e.g. 1 day). 
-                // We shift both start and end by 1 day.
                 const nextStart = addDays(parseISO(currentStart), 1);
                 const nextEnd = addDays(parseISO(currentEnd), 1);
                 currentStart = nextStart.toISOString();
@@ -86,6 +86,8 @@ export class CalComService {
             }
         }
 
+        const duration = Date.now() - startTime_perf;
+        console.log(`[PERF] getAvailability completed in ${duration}ms (no slots found after ${maxAttempts} attempts)`);
         return { message: "No availability found for the next 7 days." };
     }
 

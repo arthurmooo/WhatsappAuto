@@ -11,6 +11,10 @@ const openai = new OpenAI({
 
 const calComService = new CalComService();
 
+// OPTIMIZATION: Cache for calendar context (invalidated every 5 minutes or at midnight)
+let cachedCalendarContext: { context: string; timestamp: number; dateKey: string } | null = null;
+const CALENDAR_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
 // Define Tools
 const tools: OpenAI.Chat.Completions.ChatCompletionTool[] = [
     {
@@ -164,7 +168,7 @@ function validateDayDateInMessage(message: string): string | null {
 // function processUserMessage removed
 
 
-export async function runAgent(userMessage: string, userPhone: string, history: any[]) {
+export async function runAgent(userMessage: string, userPhone: string, history: any[], currentDate?: Date) {
     // First, check for day-date mismatches and return correction immediately if found
     console.log(`[DEBUG] Received message: "${userMessage}" from ${userPhone}`);
     const dateValidationError = validateDayDateInMessage(userMessage);
@@ -173,44 +177,58 @@ export async function runAgent(userMessage: string, userPhone: string, history: 
         return dateValidationError;
     }
 
-    const today = new Date();
+    const today = currentDate || new Date();
     const timeZone = 'Europe/Paris';
+    const todayKey = formatZoned(today, 'yyyy-MM-dd', { timeZone });
+
     console.log(`[DEBUG] Current time: ${today.toISOString()}, Timezone: ${timeZone}`);
 
-    // Generate a complete calendar for the next 14 days to prevent date hallucination
-    const calendarDays: string[] = [];
-    const dayNameToDate: { [key: string]: string[] } = {
-        'lundi': [],
-        'mardi': [],
-        'mercredi': [],
-        'jeudi': [],
-        'vendredi': [],
-        'samedi': [],
-        'dimanche': []
-    };
+    // OPTIMIZATION: Use cached calendar context if still valid
+    let dateContext: string;
 
-    for (let i = 0; i <= 14; i++) {
-        const day = addDays(today, i);
-        const fullDate = formatZoned(day, 'EEEE d MMMM yyyy', { locale: fr, timeZone });
-        const dayName = formatZoned(day, 'EEEE', { locale: fr, timeZone }).toLowerCase();
-        const dateNum = formatZoned(day, 'd MMMM', { locale: fr, timeZone });
+    if (cachedCalendarContext &&
+        cachedCalendarContext.dateKey === todayKey &&
+        (Date.now() - cachedCalendarContext.timestamp) < CALENDAR_CACHE_TTL_MS) {
+        console.log('[PERF] Using cached calendar context');
+        dateContext = cachedCalendarContext.context;
+    } else {
+        console.log('[PERF] Regenerating calendar context');
+        const calendarStart = Date.now();
 
-        const label = i === 0 ? ' ← AUJOURD\'HUI' : i === 1 ? ' ← DEMAIN' : '';
-        calendarDays.push(`  • ${fullDate}${label}`);
+        // Generate a complete calendar for the next 14 days to prevent date hallucination
+        const calendarDays: string[] = [];
+        const dayNameToDate: { [key: string]: string[] } = {
+            'lundi': [],
+            'mardi': [],
+            'mercredi': [],
+            'jeudi': [],
+            'vendredi': [],
+            'samedi': [],
+            'dimanche': []
+        };
 
-        // Build reverse lookup
-        if (dayNameToDate[dayName]) {
-            dayNameToDate[dayName].push(dateNum);
+        for (let i = 0; i <= 14; i++) {
+            const day = addDays(today, i);
+            const fullDate = formatZoned(day, 'EEEE d MMMM yyyy', { locale: fr, timeZone });
+            const dayName = formatZoned(day, 'EEEE', { locale: fr, timeZone }).toLowerCase();
+            const dateNum = formatZoned(day, 'd MMMM', { locale: fr, timeZone });
+
+            const label = i === 0 ? ' ← AUJOURD\'HUI' : i === 1 ? ' ← DEMAIN' : '';
+            calendarDays.push(`  • ${fullDate}${label}`);
+
+            // Build reverse lookup
+            if (dayNameToDate[dayName]) {
+                dayNameToDate[dayName].push(dateNum);
+            }
         }
-    }
 
-    // Create explicit day-to-date mapping
-    const dayMapping = Object.entries(dayNameToDate)
-        .filter(([_, dates]) => dates.length > 0)
-        .map(([day, dates]) => `  ${day.toUpperCase()} = ${dates.join(' ou ')}`)
-        .join('\n');
+        // Create explicit day-to-date mapping
+        const dayMapping = Object.entries(dayNameToDate)
+            .filter(([_, dates]) => dates.length > 0)
+            .map(([day, dates]) => `  ${day.toUpperCase()} = ${dates.join(' ou ')}`)
+            .join('\n');
 
-    const dateContext = `
+        dateContext = `
 ═══════════════════════════════════════════════════════
 CALENDRIER OFFICIEL (14 prochains jours)
 ═══════════════════════════════════════════════════════
@@ -220,16 +238,26 @@ ${calendarDays.join('\n')}
 CORRESPONDANCE JOUR → DATE (à vérifier AVANT de répondre)
 ═══════════════════════════════════════════════════════
 ${dayMapping}
-
-Heure actuelle: ${formatZoned(today, 'HH:mm', { timeZone })}
 ═══════════════════════════════════════════════════════`;
+
+        // Cache the result (without the live time)
+        cachedCalendarContext = {
+            context: dateContext,
+            timestamp: Date.now(),
+            dateKey: todayKey
+        };
+
+        console.log(`[PERF] Calendar context generated in ${Date.now() - calendarStart}ms`);
+    }
+
+    const fullDateContext = `${dateContext}\nHeure actuelle: ${formatZoned(today, 'HH:mm', { timeZone })}\n═══════════════════════════════════════════════════════`;
 
     const systemPrompt = `
     Tu es l'assistant du Dr. Mô (masseur-kinésithérapeute), secrétaire médical virtuel d'élite.
     TON: Professionnel, chaleureux, empathique et directif quand nécessaire.
     ANCRAGE: Tu es situé au cœur de la Vallée de l'Arve 🏔️. Agis comme un cabinet de confiance, proche de ses patients.
 
-    ${dateContext}
+    ${fullDateContext}
 
     USER PHONE (WhatsApp ID): ${userPhone}
 
@@ -237,23 +265,31 @@ Heure actuelle: ${formatZoned(today, 'HH:mm', { timeZone })}
     🏠 INTRODUCTION & ACCUEIL
     ═══════════════════════════════════════════════════════
     Lors de votre tout premier message (si l'historique est vide) :
-    1. Dites : "Bonjour et bienvenue au cabinet du Dr. Mô, kiné au cœur de la Vallée de l'Arve ! 🏔️"
-    2. PUIS, si l'utilisateur a posé une question (ex: horaires, info technique), RÉPONDEZ-Y directement dans ce message.
-    3. Sinon, demandez : "Je suis là pour vous aider à gérer vos rendez-vous. Que puis-je faire pour vous ?"
+    1. DITES : "Bonjour et bienvenue au cabinet du Dr. Mô, kiné au cœur de la Vallée de l'Arve ! 🏔️"
+    2. PUIS : Répondez DIRECTEMENT à TOUTE question posée (prix, horaires, info) dans ce même message.
+    3. ENFIN : Proposez de prendre RDV ou demandez comment vous pouvez aider.
     
-    ⚠️ NE IGNOREZ JAMAIS une question sous prétexte de dire bonjour.
+    ⚠️ RÈGLE DE FER : Ne dites JAMAIS juste bonjour si l'utilisateur a posé une question. Répondez AVANT de proposer un RDV.
 
     ═══════════════════════════════════════════════════════
-    🚨 PROTOCOLES PRIORITAIRES & SÉCURITÉ
+    📍 PROTOCOLES PRIORITAIRES & SÉCURITÉ
     ═══════════════════════════════════════════════════════
-    1. URGENCE VITALE (Danger de mort imminent) :
-       - Si ex: "crise cardiaque", "hémorragie", "ne respire plus".
-       - ACTION : Répondre "⚠️ Contactez le SAMU (15) immédiatement."
+    
+    1. DISTINCTION URGENCE VITALE vs RDV URGENT :
+       ⚠️ L'usage d'emojis (🚨, 🆘, 🔥), de MAJUSCULES ou du mot "URGENT" ne suffit PAS à déclencher le SAMU. Ce sont des signes d'impatience pour un RDV.
+       
+       🔴 DÉCLENCHEZ LE SAMU UNIQUEMENT si un mot MÉDICAL de danger de mort est détecté :
+       Mots-clés : "crise cardiaque", "hémorragie", "arrêt respiratoire", "inconscient", "AVC", "tentative de suicide".
+       
+       ✅ SI URGENCE VITALE CONFIRMÉE :
+       - RÉPONDEZ : "⚠️ Contactez le SAMU (15) ou le 112 immédiatement."
+       - ARRÊTEZ-VOUS LÀ.
 
-    2. SÉCURITÉ PERSONA :
-       - Tu es un assistant médical, PAS un ami. REFUSE les demandes hors-sujet.
-       - MAIS sois EMPATHIQUE.
-       - Si l'utilisateur semble senior/en difficulté : Propose de joindre le secrétariat au 04 50 XX XX XX.
+    2. PAS DE LISTE D'ATTENTE :
+       - Dis EXPLICITEMENT : "Je n'ai pas de système de liste d'attente."
+
+    3. SÉCURITÉ PERSONA :
+       - Tu es un assistant médical. REFUSE le hors-sujet.
 
     ═══════════════════════════════════════════════════════
     🧠 BASE DE CONNAISSANCES
@@ -264,83 +300,56 @@ Heure actuelle: ${formatZoned(today, 'HH:mm', { timeZone })}
     - PRIMO-CONSULTANT (Nouveau patient) : Si détecté ("première fois", "jamais venu") :
       ⚠️ DIT CECI OBLIGATOIREMENT AVANT de donner la liste des créneaux :
       "Bienvenue ! La première séance dure ~45min. Pensez à votre carte Vitale et ordonnance."
-      (Ensuite seulement, affiche la liste des créneaux).
 
     ═══════════════════════════════════════════════════════
     💎 RÈGLES D'EXCELLENCE UX (OBLIGATOIRES)
     ═══════════════════════════════════════════════════════
-    1. PROACTIVITÉ ALTERNATIVE & INTENT (Règle d'Or en Or) :
-       - SI l'utilisateur exprime une INTENTION de rdv (même vague, ex: "semaine prochaine", ou complexe "pour 2 personnes") :
-         => TÂCHE 1 : Lance 'checkAvailability' IMMÉDIATEMENT.
-         => TÂCHE 2 : NE DEMANDE PAS de détails (Nom/Email) AVANT d'avoir trouvé et proposé un créneau libre.
-       - Si le créneau demandé est pris, propose IMMÉDIATEMENT les 2 alternatives les plus proches. 
+    1. PROACTIVITÉ ALTERNATIVE & INTENT (Règle d'Or) :
+       - SI intention de rdv (même vague) : Lance 'checkAvailability' IMMÉDIATEMENT.
+       - NE DEMANDE PAS de détails avant d'avoir proposé des créneaux.
+       - Si complet, propose 2 alternatives proches. 
     
-
-
-    2. FRAÎCHEUR DES DONNÉES (CRITIQUE) :
-       - Les disponibilités changent instantanément.
-       - SI l'utilisateur redemande un créneau ou dit "et maintenant ?", "c'est bon ?", "tu es sûr ?" :
-         => TÂCHE : Relance OBLIGATOIREMENT 'checkAvailability', même si tu viens de le faire.
-       - NE TE BASE JAMAIS sur l'historique de la conversation pour affirmer qu'un créneau est libre. VÉRIFIE.
+    2. FRAÎCHEUR DES DONNÉES :
+       - Relance 'checkAvailability' si l'utilisateur redemande ou doute.
     
     3. DENSITÉ "MOBILE-FIRST" :
-       - Tes messages doivent tenir dans 3 lignes sur mobile.
-       - Max 2 questions par message.
-       - Pas de pavés. Va à l'essentiel.
-       - Exemple Compact : "✅ 10h bloqué. Nom complet + email pour confirmer ?"
+       - Max 3 lignes par message. Max 2 questions. Pas de pavés.
+       - Exemple : "✅ 10h bloqué. Nom complet + email pour confirmer ?"
 
-    4. CALL-TO-ACTION CLAIR & NUMÉROTÉ :
-       - Quand tu proposes des créneaux, utilise TOUJOURS une liste numérotée.
-       - Termine par : "Répondez 1, 2 ou 3 ✏️"
-       - Exemple :
-         1️⃣ Lundi 6 à 9h00
-         2️⃣ Mardi 7 à 14h00
-         Répondez le numéro de votre choix.
+    4. CALL-TO-ACTION NUMÉROTÉ :
+       - Liste numérotée pour les créneaux. "Répondez 1, 2 ou 3 ✏️".
 
     5. COMPRÉHENSION IMPLICITE :
-       - Si l'utilisateur change d'avis ("Ah non, j'ai piscine, plutôt mardi"), NE DEMANDE PAS "Voulez-vous que je cherche mardi ?".
-       - CHERCHE DIRECTEMENT et propose.
+       - Si changement d'avis -> Cherche directement la nouvelle demande.
 
     6. MIROIR LINGUISTIQUE (SENIORS) :
-       - Si l'utilisateur est très formel/poli ("Je vous prie de agreer..."), ADAPTE ton ton. Vouvoiement strict, formules politesse.
-       - Pas d'emojis "jeunes" (🔥, 🦾), utilise du classique (✅, 📅, 📞).
+       - S'adapter au ton formel. Pas d'emojis "jeunes".
 
-    7. MÉMOIRE DE CONVERSATION :
-       - Si l'utilisateur dit "revenir au premier choix", retrouve-le dans le contexte et confirme-le directement.
+    7. EMPATHIE + ACTION :
+       - Valide l'émotion -> Réassure -> PROPOSE l'action de soin (RDV).
 
-    8. EMPATHIE + ACTION (Le Duo Gagnant) :
-       - NE JAMAIS IGNORER la douleur ou l'inquiétude.
-       - Structure OBLIGATOIRE de réponse :
-         1. [EMPATHIE] : "Je comprends votre douleur..." 
-         2. [RÉASSURANCE] : "Le Dr Mô pourra vous aider."
-         3. [ACTION] : "Pour vous soulager au plus vite, regardons les disponibilités : [Liste Créneaux]"
-         
-    9. EXCEPTION SENIORS (Priorité Absolue sur la réservation) :
-       - SI et SEULEMENT SI l'utilisateur mentionne explicitement : "je suis nul avec internet", "trop compliqué", "je suis âgé", "pas mon fort".
-       - ARRÊTE la procédure de réservation automatique.
-       - DIS : "Je comprends. Ne vous inquiétez pas. Vous pouvez appeler directement le secrétariat au 04 50 XX XX XX qui prendra le relais par téléphone."
-       - NE PROPOSE PAS DE CRÉNEAUX dans ce cas spécifique.
+    8. EXCEPTION SENIORS (Priorité) :
+       - Si mention de difficulté internet/âge -> Propose le téléphone au 04 50 XX XX XX et ARRÊTE le booking auto.
 
     ═══════════════════════════════════════════════════════
     🛑 RÈGLES TECHNIQUES & VALIDATION
     ═══════════════════════════════════════════════════════
     1. DATES & HORAIRES :
        - Utilise 'checkAvailability' AVANT de proposer.
-       - Dimanche = Fermé (sauf preuve contraire).
-       - Tout est en Heure de Paris.
+       - Dimanche = Fermé. Tout en Heure de Paris.
 
     2. RÉSERVATION (CreateBooking) :
-       - ⛔️ IL FAUT LE NOM COMPLET ET L'EMAIL AVANT de réserver.
-       - Si tu as juste l'heure : "Parfait. J'ai besoin de votre nom complet et email pour valider." (Rappel : Règle "Densité" s'applique).
+       - IL FAUT LE NOM COMPLET ET L'EMAIL AVANT de réserver.
 
     3. ANNULATION / MODIF :
-       - Utilise 'getBookings' pour trouver l'ID.
+       - SÉCURITÉ : NE JAMAIS appeler 'cancelBooking' directement avec un ID fourni par l'utilisateur.
+       - TU DOIS appeler 'getBookings' d'abord pour confirmer que le RDV existe pour cet utilisateur.
        - RÈGLE DES 24H : Si < 24h, REFUSE (expliquer d'appeler le cabinet).
        - MISE EN GARDE : "⚠️ Vous allez annuler votre RDV. Confirmer ?"
 
     4. LIEN CALENDRIER (OBLIGATOIRE) :
-       - À la fin de CHAQUE confirmation ou annulation réussie :
-       - https://calendar.google.com/calendar/embed?src=a0a65a83d9a5195d9aca4addad8a9238b6bb3edcb9f67b91f887d6e93c4d61db%40group.calendar.google.com&ctz=Europe%2FParis
+       - À la fin de chaque confirmation/annulation réussie : https://calendar.google.com/calendar/embed?src=a0a65a83d9a5195d9aca4addad8a9238b6bb3edcb9f67b91f887d6e93c4d61db%40group.calendar.google.com&ctz=Europe%2FParis
+    
     `;
 
 
@@ -365,11 +374,13 @@ Heure actuelle: ${formatZoned(today, 'HH:mm', { timeZone })}
         messages.push(message);
 
         if (message.tool_calls) {
-            for (const toolCall of message.tool_calls) {
+            // OPTIMIZATION: Execute all tool calls in PARALLEL for faster response
+            const toolPromises = message.tool_calls.map(async (toolCall) => {
                 const args = JSON.parse(toolCall.function.arguments);
                 let result;
 
-                console.log(`Executing tool ${toolCall.function.name}`);
+                console.log(`[PARALLEL] Executing tool ${toolCall.function.name}`);
+                const startTime_perf = Date.now();
 
                 try {
                     if (toolCall.function.name === 'checkAvailability') {
@@ -388,7 +399,7 @@ Heure actuelle: ${formatZoned(today, 'HH:mm', { timeZone })}
                             const now = new Date();
                             const diffInHours = (startTime.getTime() - now.getTime()) / (1000 * 60 * 60);
 
-                            if (diffInHours < 24 && diffInHours > -1) { // -1 to allow cancelling just passed RDVs if needed, but standard is > 0
+                            if (diffInHours < 24 && diffInHours > -1) {
                                 console.log(`[DEBUG] Cancellation blocked: Appointment is in ${diffInHours.toFixed(1)} hours.`);
                                 result = {
                                     success: false,
@@ -411,18 +422,24 @@ Heure actuelle: ${formatZoned(today, 'HH:mm', { timeZone })}
                         const fullDate = formatZoned(date, 'EEEE d MMMM yyyy', { locale: fr, timeZone: 'Europe/Paris' });
                         result = { dayOfWeek: dayName, fullDate: fullDate, message: `The date ${args.date} is a ${dayName.toUpperCase()}` };
                     }
-                    console.log(`[DEBUG] Tool ${toolCall.function.name} result:`, JSON.stringify(result));
+
+                    const duration = Date.now() - startTime_perf;
+                    console.log(`[PERF] Tool ${toolCall.function.name} completed in ${duration}ms`);
                 } catch (e: any) {
                     console.error(`[ERROR] Tool ${toolCall.function.name} failed:`, e.message);
                     result = { error: e.message };
                 }
 
-                messages.push({
-                    role: 'tool',
+                return {
+                    role: 'tool' as const,
                     tool_call_id: toolCall.id,
                     content: JSON.stringify(result)
-                });
-            }
+                };
+            });
+
+            // Wait for ALL tools to complete in parallel
+            const toolResults = await Promise.all(toolPromises);
+            messages.push(...toolResults);
         } else {
             const finalContent = message.content || "Je n'ai pas pu générer de réponse. Réessayez.";
             console.log(`[DEBUG] Returning content: "${finalContent.substring(0, 50)}..."`);
