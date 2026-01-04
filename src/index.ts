@@ -12,12 +12,15 @@ const whatsappService = new WhatsAppService();
 const sessions = new Map<string, any[]>();
 
 app.post('/webhook/whatsapp', async (req, res) => {
-    const { Body, From } = req.body;
+    const { Body, From, MessageSid } = req.body;
 
     console.log(`Received message from ${From}: ${Body}`);
 
     // 1. Acknowledge Twilio immediately to avoid timeout
     res.status(200).send('<Response></Response>');
+
+    // 2. Send Typing Indicator (Fire and forget)
+    whatsappService.sendTypingIndicator(MessageSid).catch(console.error);
 
     // 2. Process in background
     try {
