@@ -246,4 +246,41 @@ export class CalComService {
             return { success: false, error: errorMessage, message: `Failed to cancel booking (ID: ${bookingId}). API said: ${errorMessage}` };
         }
     }
+
+    /**
+     * Delete all active bookings for the configured event type.
+     * Useful for cleaning up the demo environment.
+     */
+    async deleteAllBookings() {
+        console.log('[CLEANUP] Starting automatic calendar cleanup...');
+        try {
+            // Fetch all bookings (without userEmail/waId filter to get everything)
+            const response = await this.getBookings();
+            const bookings = response.bookings || [];
+
+            if (bookings.length === 0) {
+                console.log('[CLEANUP] No active bookings found to delete.');
+                return { success: true, count: 0 };
+            }
+
+            console.log(`[CLEANUP] Found ${bookings.length} active bookings to delete.`);
+
+            let deletedCount = 0;
+            for (const booking of bookings) {
+                try {
+                    console.log(`[CLEANUP] Deleting booking ${booking.id} (${booking.attendeeName})...`);
+                    await this.cancelBooking(booking.id, "Automatic demo cleanup");
+                    deletedCount++;
+                } catch (err: any) {
+                    console.error(`[CLEANUP] Failed to delete booking ${booking.id}:`, err.message);
+                }
+            }
+
+            console.log(`[CLEANUP] Cleanup completed. Deleted ${deletedCount} bookings.`);
+            return { success: true, count: deletedCount };
+        } catch (error: any) {
+            console.error('[CLEANUP] Error during automatic cleanup:', error.message);
+            return { success: false, error: error.message };
+        }
+    }
 }

@@ -2,11 +2,23 @@ import express from 'express';
 import { config } from './config';
 import { runAgent } from './agent/bot';
 import { WhatsAppService } from './services/whatsapp';
+import cron from 'node-cron';
+import { CalComService } from './services/calcom';
 
 const app = express();
 app.use(express.urlencoded({ extended: true })); // Twilio sends form-urlencoded
 
 const whatsappService = new WhatsAppService();
+const calcomService = new CalComService();
+
+// Schedule automatic calendar cleanup every 2 hours
+cron.schedule('0 */2 * * *', async () => {
+    try {
+        await calcomService.deleteAllBookings();
+    } catch (error) {
+        console.error('[CRON] Failed to run automated cleanup:', error);
+    }
+});
 
 // In-memory session storage (Replace with Redis/DB in production)
 const sessions = new Map<string, any[]>();
