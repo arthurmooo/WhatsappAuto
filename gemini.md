@@ -62,6 +62,10 @@ Permet de tester le bot sans WhatsApp via terminal (`npm run console`).
 3.  **BookingId Hallucination**: Fixé par instruction stricte dans le système prompt + description des tools.
 4.  **Infinite Cancel Loop**: Fixé en filtrant les bookings déjà annulés dans `getBookings`.
 
+### 🐙 5. Gestion de GitHub
+**Règle d'Or**: Ne **JAMAIS** faire de `git push` sans une demande explicite de l'utilisateur. 
+- L'IA peut faire des commits locaux pour sauvegarder le travail, mais l'envoi vers le serveur distant est réservé à l'utilisateur ou à sa demande directe.
+
 ## 🚀 Commandes Utiles
 - **Lancer le test console**: `npm run console` (Le moyen le plus rapide de vérifier la logique)
 - **Lancer le serveur**: `npm run dev`
